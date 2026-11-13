@@ -282,7 +282,7 @@ fun inWindow(f: Flight, start: Int, end: Int): Boolean {
     return if (start <= end) m in start..end else (m >= start || m <= end)
 }
 
-data class WidgetCfg(val intl: Boolean, val rows: Int)
+data class WidgetCfg(val intl: Boolean)
 
 object Store {
     const val DEFAULT_ACCENT = 0xFF1565C0.toInt()
@@ -290,12 +290,12 @@ object Store {
     fun accent(c: Context) = p(c).getInt("accent", DEFAULT_ACCENT)
 
     fun widget(c: Context, id: Int): WidgetCfg {
-        val s = p(c).getString("w$id", null) ?: return WidgetCfg(true, 8)
+        val s = p(c).getString("w$id", null) ?: return WidgetCfg(true)
         val o = JSONObject(s)
-        return WidgetCfg(o.optBoolean("intl", true), o.optInt("rows", 8).coerceIn(6, 10))
+        return WidgetCfg(o.optBoolean("intl", true))
     }
     fun saveWidget(c: Context, id: Int, w: WidgetCfg) {
-        p(c).edit().putString("w$id", JSONObject().put("intl", w.intl).put("rows", w.rows).toString()).apply()
+        p(c).edit().putString("w$id", JSONObject().put("intl", w.intl).toString()).apply()
     }
     fun deleteWidget(c: Context, id: Int) { p(c).edit().remove("w$id").apply() }
 }

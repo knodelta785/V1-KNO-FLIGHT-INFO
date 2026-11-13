@@ -6,7 +6,10 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.widget.Toast
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
@@ -39,29 +42,22 @@ object ShiftFmt {
     }
 }
 
-/** Flight yang dikecualikan dari laporan. scope: "ARR", "DEP", atau "BOTH". */
-data class Excl(val text: String, val scope: String)
+/** Flight yang dikecualikan dari laporan (per nomor flight + arah, berlaku setiap hari). */
+data class Excl(val key: String, val label: String)
 
 object ReportEx {
+    fun key(f: Flight) = (if (f.arrival) "A|" else "D|") + f.number.uppercase().filter { it.isLetterOrDigit() }
+    fun label(f: Flight) = (if (f.arrival) "Datang" else "Berangkat") + " · ${f.number}" +
+        if (f.airline.isNotEmpty()) " · ${f.airline}" else ""
+
     fun load(c: Context): List<Excl> {
-        val a = JSONArray(Store.p(c).getString("rep_excl", "[]"))
-        return (0 until a.length()).map { val o = a.getJSONObject(it); Excl(o.getString("t"), o.getString("s")) }
+        val a = JSONArray(Store.p(c).getString("rep_excl2", "[]"))
+        return (0 until a.length()).map { val o = a.getJSONObject(it); Excl(o.getString("k"), o.getString("l")) }
     }
     fun save(c: Context, l: List<Excl>) {
         val a = JSONArray()
-        l.forEach { a.put(JSONObject().put("t", it.text).put("s", it.scope)) }
-        Store.p(c).edit().putString("rep_excl", a.toString()).apply()
-    }
-    private fun norm(s: String) = s.uppercase().filter { it.isLetterOrDigit() }
-
-    /** Cocok jika sama dengan nomor flight, kode IATA/ICAO maskapai, atau nama maskapai memuat teksnya. */
-    fun matches(e: Excl, f: Flight): Boolean {
-        val applies = e.scope == "BOTH" || (e.scope == "ARR" && f.arrival) || (e.scope == "DEP" && !f.arrival)
-        if (!applies) return false
-        val n = norm(e.text)
-        if (n.isEmpty()) return false
-        return n == norm(f.number) || n == f.airlineIata.uppercase() || n == f.airlineIcao.uppercase() ||
-            (n.length >= 3 && norm(f.airline).contains(n))
+        l.forEach { a.put(JSONObject().put("k", it.key).put("l", it.label)) }
+        Store.p(c).edit().putString("rep_excl2", a.toString()).apply()
     }
 }
 
@@ -99,6 +95,18 @@ object Report {
     private fun airline(f: Flight) = AIRLINES[f.airlineIata] ?: f.airline
     private fun city(f: Flight) = CITIES[f.iata] ?: f.city
 
+    /** Flight internasional (tidak dibatalkan) yang ETA/ETD-nya jatuh di rentang, belum dikurangi pengecualian. */
+    fun candidates(l: List<Flight>, from: Long, to: Long): List<Flight> =
+        l.filter { it.international && !it.cancelled && eta(it) in from..to }.sortedBy { eta(it) }
+
+    /** Satu baris ringkas untuk daftar centang pengecualian. */
+    fun describe(f: Flight, startDay: Long): String {
+        val e = eta(f)
+        var jam = Fmt.timeDot(e)
+        if (Fmt.dayKey(e) != startDay) jam += " (${Fmt.dayMonth(e)})"
+        return "${airline(f)} ${f.number} · $jam · ${city(f)}/${f.iata}"
+    }
+
     private fun line(fmt: String, no: Int, f: Flight, startDay: Long): String {
         val e = eta(f)
         var jam = Fmt.timeDot(e)
@@ -117,16 +125,13 @@ object Report {
             .trimEnd()
     }
 
-    /** Hanya flight internasional (tidak dibatalkan, tidak dikecualikan) yang ETA/ETD-nya jatuh di rentang [from, to]. */
     fun build(
         tpl: String, arrFmt: String, depFmt: String, shiftName: String, shiftCode: String,
         from: Long, to: Long, arrivals: List<Flight>, departures: List<Flight>, excl: List<Excl>
     ): String {
-        fun pick(l: List<Flight>) = l.filter { f ->
-            f.international && !f.cancelled && eta(f) in from..to && excl.none { ReportEx.matches(it, f) }
-        }.sortedBy { eta(it) }
-        val a = pick(arrivals)
-        val d = pick(departures)
+        val keys = excl.map { it.key }.toSet()
+        val a = candidates(arrivals, from, to).filter { ReportEx.key(it) !in keys }
+        val d = candidates(departures, from, to).filter { ReportEx.key(it) !in keys }
         val startDay = Fmt.dayKey(from)
         val tanggal = if (Fmt.dayKey(from) == Fmt.dayKey(to)) Fmt.dateFull(from)
         else "${Fmt.dateFull(from)} s/d ${Fmt.dateFull(to)}"
@@ -150,40 +155,83 @@ object Report {
     }
 }
 
+/** Daftar flight kedatangan dan keberangkatan pada rentang laporan; centang = dikecualikan dari laporan. */
 @Composable
-fun ExclusionDialog(list: List<Excl>, onChange: (List<Excl>) -> Unit, onClose: () -> Unit) {
-    var text by remember { mutableStateOf("") }
-    var scope by remember { mutableStateOf("BOTH") }
-    AlertDialog(
-        onDismissRequest = onClose,
-        title = { Text("Pengecualian flight") },
-        text = {
-            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedTextField(
-                    text, { text = it }, Modifier.fillMaxWidth(), singleLine = true,
-                    label = { Text("Maskapai / kode / nomor (mis. My Indo)") }
-                )
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    FilterChip(scope == "ARR", { scope = "ARR" }, { Text("Datang") })
-                    FilterChip(scope == "DEP", { scope = "DEP" }, { Text("Berangkat") })
-                    FilterChip(scope == "BOTH", { scope = "BOTH" }, { Text("Keduanya") })
+fun ExclusionScreen(from: Long, to: Long, excl: List<Excl>, onChange: (List<Excl>) -> Unit, onClose: () -> Unit) {
+    var arr by remember { mutableStateOf(listOf<Flight>()) }
+    var dep by remember { mutableStateOf(listOf<Flight>()) }
+    var loading by remember { mutableStateOf(true) }
+    var err by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(from, to) {
+        loading = true; err = null
+        try {
+            val earlier = if (from < Fmt.now()) 5 else 0
+            val a = withContext(Dispatchers.IO) { Fr24.fetch(true, earlier) }
+            val d = withContext(Dispatchers.IO) { Fr24.fetch(false, earlier) }
+            arr = Report.candidates(a, from, to)
+            dep = Report.candidates(d, from, to)
+        } catch (e: Exception) {
+            err = "Gagal memuat data: ${e.message}"
+        }
+        loading = false
+    }
+
+    val keys = excl.map { it.key }.toSet()
+    val startDay = Fmt.dayKey(from)
+    fun toggle(f: Flight, on: Boolean) {
+        val k = ReportEx.key(f)
+        onChange(if (on) excl.filter { it.key != k } + Excl(k, ReportEx.label(f)) else excl.filter { it.key != k })
+    }
+    val shownKeys = (arr + dep).map { ReportEx.key(it) }.toSet()
+    val others = excl.filter { it.key !in shownKeys }
+
+    Column(Modifier.fillMaxSize()) {
+        Row(Modifier.padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Pengecualian flight", fontWeight = FontWeight.Bold)
+                Text("${Fmt.dateShort(from)} ${Fmt.time(from)} → ${Fmt.dateShort(to)} ${Fmt.time(to)}", fontSize = 12.sp)
+            }
+            Button(onClick = onClose) { Text("Selesai") }
+        }
+        if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
+        err?.let { Text(it, color = AlertRed, fontSize = 13.sp, modifier = Modifier.padding(horizontal = 16.dp)) }
+
+        LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)) {
+            item { Text("Kedatangan (${arr.size})", Modifier.padding(8.dp), fontWeight = FontWeight.Bold) }
+            items(arr, key = { "a" + it.key }) { f ->
+                val on = ReportEx.key(f) in keys
+                Row(Modifier.fillMaxWidth().clickable { toggle(f, !on) }, verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(on, { toggle(f, it) })
+                    Text(Report.describe(f, startDay), fontSize = 13.sp)
                 }
-                Button(enabled = text.trim().length >= 2, onClick = {
-                    onChange(list + Excl(text.trim(), scope)); text = ""
-                }) { Text("Tambah") }
-                list.forEachIndexed { i, e ->
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            "${e.text} · " + when (e.scope) { "ARR" -> "Datang"; "DEP" -> "Berangkat"; else -> "Keduanya" },
-                            Modifier.weight(1f)
-                        )
-                        TextButton(onClick = { onChange(list.filterIndexed { j, _ -> j != i }) }) { Text("✕") }
+            }
+            item { Text("Keberangkatan (${dep.size})", Modifier.padding(8.dp), fontWeight = FontWeight.Bold) }
+            items(dep, key = { "d" + it.key }) { f ->
+                val on = ReportEx.key(f) in keys
+                Row(Modifier.fillMaxWidth().clickable { toggle(f, !on) }, verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(on, { toggle(f, it) })
+                    Text(Report.describe(f, startDay), fontSize = 13.sp)
+                }
+            }
+            if (others.isNotEmpty()) {
+                item { Text("Dikecualikan (tidak ada di rentang ini)", Modifier.padding(8.dp), fontWeight = FontWeight.Bold) }
+                items(others, key = { "o" + it.key }) { e ->
+                    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                        Text(e.label, Modifier.weight(1f).padding(start = 12.dp), fontSize = 13.sp)
+                        TextButton(onClick = { onChange(excl.filter { it.key != e.key }) }) { Text("✕") }
                     }
                 }
             }
-        },
-        confirmButton = { TextButton(onClick = onClose) { Text("Selesai") } }
-    )
+            if (excl.isNotEmpty()) {
+                item {
+                    OutlinedButton(onClick = { onChange(emptyList()) }, modifier = Modifier.padding(8.dp)) {
+                        Text("Hapus semua centang")
+                    }
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -210,6 +258,12 @@ fun ReportTab() {
 
     // jam selesai <= jam mulai berarti selesai di hari berikutnya
     fun fixEnd() { if (toDay <= fromDay + 1) toDay = fromDay + (if (toMin <= fromMin) 1 else 0) }
+    fun rangeEpoch(): Pair<Long, Long> {
+        val f = Fmt.dayStart(fromDay) + fromMin * 60L
+        var t = Fmt.dayStart(toDay) + toMin * 60L
+        if (t <= f) t += 86400L
+        return f to t
+    }
 
     LaunchedEffect(Unit) { fixEnd() }
 
@@ -218,109 +272,106 @@ fun ReportTab() {
         DatePickerDialog(ctx, { _, yy, mm, dd -> onPick(Fmt.dayKeyOf(yy, mm, dd)) }, y, m, d).show()
     }
 
-    Column(Modifier.padding(16.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Text("Laporan jadwal (internasional)", fontWeight = FontWeight.Bold)
+    if (showEx) {
+        val r = rangeEpoch()
+        ExclusionScreen(r.first, r.second, excl, onChange = { excl = it; ReportEx.save(ctx, it) }, onClose = { showEx = false })
+    } else {
+        Column(Modifier.padding(16.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Laporan jadwal (internasional)", fontWeight = FontWeight.Bold)
 
-        Text("Shift", fontWeight = FontWeight.SemiBold)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf("P" to "Pagi", "S" to "Siang", "M" to "Malam").forEach { (code, name) ->
-                FilterChip(stype == code, {
-                    stype = code
-                    shiftName = name.lowercase()
-                    sp.edit().putString("rep_stype", code).putString("rep_shift", shiftName).apply()
-                    val r = ShiftFmt.range(code)
-                    fromMin = r.first; toMin = r.second
-                    toDay = fromDay + (if (toMin <= fromMin) 1 else 0)
-                }, { Text(name) })
-            }
-        }
-        OutlinedTextField(
-            shiftName, { shiftName = it; sp.edit().putString("rep_shift", it).apply() },
-            Modifier.fillMaxWidth(), singleLine = true, label = { Text("Nama shift") }
-        )
-
-        Text("Tarik data mulai", fontWeight = FontWeight.SemiBold)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(onClick = { pickDate(fromDay) { fromDay = it; toDay = it; fixEnd() } }) {
-                Text("📅 ${Fmt.dateShort(Fmt.dayStart(fromDay) + 3600)}")
-            }
-            TimeButton("", fromMin) { fromMin = it; fixEnd() }
-        }
-        Text("Tarik data sampai", fontWeight = FontWeight.SemiBold)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(onClick = { pickDate(toDay) { toDay = it } }) {
-                Text("📅 ${Fmt.dateShort(Fmt.dayStart(toDay) + 3600)}")
-            }
-            TimeButton("", toMin) { toMin = it; fixEnd() }
-        }
-
-        OutlinedButton(onClick = { showEx = true }) {
-            Text("🚫 Pengecualian flight" + if (excl.isNotEmpty()) " (${excl.size})" else "")
-        }
-
-        Button(enabled = !loading, onClick = {
-            scope.launch {
-                loading = true; err = null
-                try {
-                    val f = Fmt.dayStart(fromDay) + fromMin * 60L
-                    var t = Fmt.dayStart(toDay) + toMin * 60L
-                    if (t <= f) t += 86400L
-                    val earlier = if (f < Fmt.now()) 5 else 0
-                    val a = withContext(Dispatchers.IO) { Fr24.fetch(true, earlier) }
-                    val d = withContext(Dispatchers.IO) { Fr24.fetch(false, earlier) }
-                    result = Report.build(tpl, arrFmt, depFmt, shiftName, stype, f, t, a, d, excl)
-                } catch (e: Exception) {
-                    err = "Gagal memuat data: ${e.message}"
+            Text("Shift", fontWeight = FontWeight.SemiBold)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                listOf("P" to "Pagi", "S" to "Siang", "M" to "Malam").forEach { (code, name) ->
+                    FilterChip(stype == code, {
+                        stype = code
+                        shiftName = name.lowercase()
+                        sp.edit().putString("rep_stype", code).putString("rep_shift", shiftName).apply()
+                        val r = ShiftFmt.range(code)
+                        fromMin = r.first; toMin = r.second
+                        toDay = fromDay + (if (toMin <= fromMin) 1 else 0)
+                    }, { Text(name) })
                 }
-                loading = false
             }
-        }) { Text(if (loading) "Memuat…" else "Buat laporan") }
-        if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
-        err?.let { Text(it, color = AlertRed, fontSize = 13.sp) }
+            OutlinedTextField(
+                shiftName, { shiftName = it; sp.edit().putString("rep_shift", it).apply() },
+                Modifier.fillMaxWidth(), singleLine = true, label = { Text("Nama shift") }
+            )
 
-        OutlinedTextField(result, { result = it }, Modifier.fillMaxWidth(), minLines = 10, label = { Text("Hasil (bisa diedit)") })
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(enabled = result.isNotBlank(), onClick = {
-                ctx.getSystemService(ClipboardManager::class.java)
-                    .setPrimaryClip(ClipData.newPlainText("Jadwal KNO", result))
-                Toast.makeText(ctx, "Tersalin", Toast.LENGTH_SHORT).show()
-            }) { Text("📋 Salin") }
-            Button(enabled = result.isNotBlank(), onClick = {
-                val i = Intent(Intent.ACTION_SEND).apply { type = "text/plain"; putExtra(Intent.EXTRA_TEXT, result) }
-                ctx.startActivity(Intent.createChooser(i, "Bagikan jadwal"))
-            }) { Text("📤 Bagikan") }
-        }
+            Text("Tarik data mulai", fontWeight = FontWeight.SemiBold)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                OutlinedButton(onClick = { pickDate(fromDay) { fromDay = it; toDay = it; fixEnd() } }) {
+                    Text("📅 ${Fmt.dateShort(Fmt.dayStart(fromDay) + 3600)}")
+                }
+                TimeButton("", fromMin) { fromMin = it; fixEnd() }
+            }
+            Text("Tarik data sampai", fontWeight = FontWeight.SemiBold)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                OutlinedButton(onClick = { pickDate(toDay) { toDay = it } }) {
+                    Text("📅 ${Fmt.dateShort(Fmt.dayStart(toDay) + 3600)}")
+                }
+                TimeButton("", toMin) { toMin = it; fixEnd() }
+            }
 
-        OutlinedButton(onClick = { showFmt = !showFmt }) { Text(if (showFmt) "Tutup format" else "✎ Ubah format teks") }
-        if (showFmt) {
-            OutlinedTextField(
-                tpl, { tpl = it; sp.edit().putString("rep_tpl", it).apply() },
-                Modifier.fillMaxWidth(), minLines = 8, label = { Text("Format laporan") }
-            )
-            OutlinedTextField(
-                arrFmt, { arrFmt = it; sp.edit().putString("rep_arr", it).apply() },
-                Modifier.fillMaxWidth(), label = { Text("Format baris kedatangan") }
-            )
-            OutlinedTextField(
-                depFmt, { depFmt = it; sp.edit().putString("rep_dep", it).apply() },
-                Modifier.fillMaxWidth(), label = { Text("Format baris keberangkatan") }
-            )
-            Text(
-                "Kode laporan: {SALAM} {SHIFT} {JAM_MULAI} {JAM_SELESAI} {JAM_TARIK_MULAI} {JAM_TARIK_SELESAI} {TANGGAL} " +
-                    "{TANGGAL_MULAI} {TANGGAL_SELESAI} {KEDATANGAN} {KEBERANGKATAN} {JML_DATANG} {JML_BERANGKAT}\n" +
-                    "Kode baris: {NO} {MASKAPAI} {NOMOR} {JAM} {JADWAL} {KOTA} {IATA} {NEGARA} {PESAWAT} {DELAY}",
-                fontSize = 11.sp
-            )
-            OutlinedButton(onClick = {
-                tpl = Report.DEFAULT_TEMPLATE; arrFmt = Report.DEFAULT_ARR; depFmt = Report.DEFAULT_DEP
-                sp.edit().putString("rep_tpl", tpl).putString("rep_arr", arrFmt).putString("rep_dep", depFmt).apply()
-            }) { Text("Kembalikan format awal") }
+            OutlinedButton(onClick = { showEx = true }) {
+                Text("🚫 Pengecualian flight" + if (excl.isNotEmpty()) " (${excl.size})" else "")
+            }
+
+            Button(enabled = !loading, onClick = {
+                scope.launch {
+                    loading = true; err = null
+                    try {
+                        val (f, t) = rangeEpoch()
+                        val earlier = if (f < Fmt.now()) 5 else 0
+                        val a = withContext(Dispatchers.IO) { Fr24.fetch(true, earlier) }
+                        val d = withContext(Dispatchers.IO) { Fr24.fetch(false, earlier) }
+                        result = Report.build(tpl, arrFmt, depFmt, shiftName, stype, f, t, a, d, excl)
+                    } catch (e: Exception) {
+                        err = "Gagal memuat data: ${e.message}"
+                    }
+                    loading = false
+                }
+            }) { Text(if (loading) "Memuat…" else "Buat laporan") }
+            if (loading) LinearProgressIndicator(Modifier.fillMaxWidth())
+            err?.let { Text(it, color = AlertRed, fontSize = 13.sp) }
+
+            OutlinedTextField(result, { result = it }, Modifier.fillMaxWidth(), minLines = 10, label = { Text("Hasil (bisa diedit)") })
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(enabled = result.isNotBlank(), onClick = {
+                    ctx.getSystemService(ClipboardManager::class.java)
+                        .setPrimaryClip(ClipData.newPlainText("Jadwal KNO", result))
+                    Toast.makeText(ctx, "Tersalin", Toast.LENGTH_SHORT).show()
+                }) { Text("📋 Salin") }
+                Button(enabled = result.isNotBlank(), onClick = {
+                    val i = Intent(Intent.ACTION_SEND).apply { type = "text/plain"; putExtra(Intent.EXTRA_TEXT, result) }
+                    ctx.startActivity(Intent.createChooser(i, "Bagikan jadwal"))
+                }) { Text("📤 Bagikan") }
+            }
+
+            OutlinedButton(onClick = { showFmt = !showFmt }) { Text(if (showFmt) "Tutup format" else "✎ Ubah format teks") }
+            if (showFmt) {
+                OutlinedTextField(
+                    tpl, { tpl = it; sp.edit().putString("rep_tpl", it).apply() },
+                    Modifier.fillMaxWidth(), minLines = 8, label = { Text("Format laporan") }
+                )
+                OutlinedTextField(
+                    arrFmt, { arrFmt = it; sp.edit().putString("rep_arr", it).apply() },
+                    Modifier.fillMaxWidth(), label = { Text("Format baris kedatangan") }
+                )
+                OutlinedTextField(
+                    depFmt, { depFmt = it; sp.edit().putString("rep_dep", it).apply() },
+                    Modifier.fillMaxWidth(), label = { Text("Format baris keberangkatan") }
+                )
+                Text(
+                    "Kode laporan: {SALAM} {SHIFT} {JAM_MULAI} {JAM_SELESAI} {JAM_TARIK_MULAI} {JAM_TARIK_SELESAI} {TANGGAL} " +
+                        "{TANGGAL_MULAI} {TANGGAL_SELESAI} {KEDATANGAN} {KEBERANGKATAN} {JML_DATANG} {JML_BERANGKAT}\n" +
+                        "Kode baris: {NO} {MASKAPAI} {NOMOR} {JAM} {JADWAL} {KOTA} {IATA} {NEGARA} {PESAWAT} {DELAY}",
+                    fontSize = 11.sp
+                )
+                OutlinedButton(onClick = {
+                    tpl = Report.DEFAULT_TEMPLATE; arrFmt = Report.DEFAULT_ARR; depFmt = Report.DEFAULT_DEP
+                    sp.edit().putString("rep_tpl", tpl).putString("rep_arr", arrFmt).putString("rep_dep", depFmt).apply()
+                }) { Text("Kembalikan format awal") }
+            }
         }
     }
-
-    if (showEx) ExclusionDialog(
-        list = excl,
-        onChange = { excl = it; ReportEx.save(ctx, it) },
-        onClose = { showEx = false }
-    )
 }

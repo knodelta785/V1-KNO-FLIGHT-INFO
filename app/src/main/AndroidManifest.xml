@@ -24,11 +24,18 @@
             </intent-filter>
         </activity>
 
-        <receiver android:name=".FlightWidget" android:exported="true" android:label="KNO Live">
+        <receiver android:name=".FlightWidgetArr" android:exported="true" android:label="KNO Kedatangan">
             <intent-filter>
                 <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
             </intent-filter>
-            <meta-data android:name="android.appwidget.provider" android:resource="@xml/flight_widget_info" />
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/flight_widget_arr_info" />
+        </receiver>
+
+        <receiver android:name=".FlightWidgetDep" android:exported="true" android:label="KNO Keberangkatan">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data android:name="android.appwidget.provider" android:resource="@xml/flight_widget_dep_info" />
         </receiver>
 
         <receiver android:name=".WatchReceiver" android:exported="false" />

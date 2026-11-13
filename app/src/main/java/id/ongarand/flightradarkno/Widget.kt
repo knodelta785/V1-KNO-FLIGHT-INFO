@@ -19,10 +19,12 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 
-class FlightWidget : AppWidgetProvider() {
+abstract class FlightWidgetBase : AppWidgetProvider() {
+    abstract val dir: String   // "ARR" atau "DEP"
+
     override fun onUpdate(c: Context, m: AppWidgetManager, ids: IntArray) {
         AppCtx.set(c)
-        ids.forEach { WidgetUtil.update(c, m, it) }
+        ids.forEach { WidgetUtil.update(c, m, it, dir) }
         m.notifyAppWidgetViewDataChanged(ids, R.id.w_list)
     }
     override fun onEnabled(c: Context) { Refresh.schedule(c) }
@@ -34,32 +36,47 @@ class FlightWidget : AppWidgetProvider() {
     }
 }
 
+class FlightWidgetArr : FlightWidgetBase() { override val dir = "ARR" }
+class FlightWidgetDep : FlightWidgetBase() { override val dir = "DEP" }
+
 object WidgetUtil {
     const val ACTION_REFRESH = "id.ongarand.flightradarkno.REFRESH"
 
-    private fun ids(c: Context): IntArray =
-        AppWidgetManager.getInstance(c).getAppWidgetIds(ComponentName(c, FlightWidget::class.java))
+    private fun kinds(): List<Pair<Class<*>, String>> =
+        listOf(FlightWidgetArr::class.java to "ARR", FlightWidgetDep::class.java to "DEP")
 
-    fun hasWidgets(c: Context) = ids(c).isNotEmpty()
+    fun hasWidgets(c: Context): Boolean {
+        val m = AppWidgetManager.getInstance(c)
+        return kinds().any { m.getAppWidgetIds(ComponentName(c, it.first)).isNotEmpty() }
+    }
+
+    fun dirOf(c: Context, id: Int): String {
+        val info = AppWidgetManager.getInstance(c).getAppWidgetInfo(id)
+        return if (info?.provider?.className?.endsWith("FlightWidgetDep") == true) "DEP" else "ARR"
+    }
 
     fun refreshAll(c: Context) {
         val m = AppWidgetManager.getInstance(c)
-        val ids = ids(c)
-        if (ids.isEmpty()) return
-        ids.forEach { update(c, m, it) }
-        m.notifyAppWidgetViewDataChanged(ids, R.id.w_list)
+        for ((cls, dir) in kinds()) {
+            val ids = m.getAppWidgetIds(ComponentName(c, cls))
+            if (ids.isEmpty()) continue
+            ids.forEach { update(c, m, it, dir) }
+            m.notifyAppWidgetViewDataChanged(ids, R.id.w_list)
+        }
     }
 
-    fun update(c: Context, m: AppWidgetManager, id: Int) {
+    fun update(c: Context, m: AppWidgetManager, id: Int, dir: String) {
         val cfg = Store.widget(c, id)
         val v = RemoteViews(c.packageName, R.layout.widget_flight)
-        v.setTextViewText(R.id.w_title, "🛰 KNO Live · ${if (cfg.intl) "Int'l" else "Semua"}")
+        val label = if (dir == "ARR") "🛬 KNO Kedatangan" else "🛫 KNO Keberangkatan"
+        v.setTextViewText(R.id.w_title, "$label · ${if (cfg.intl) "Int'l" else "Semua"}")
         v.setTextViewText(R.id.w_sub, Fmt.dateLabel(Fmt.now()))
         v.setTextViewText(R.id.w_empty, "Tidak ada flight")
         v.setInt(R.id.w_header, "setBackgroundColor", Store.accent(c))
 
         val svc = Intent(c, WidgetService::class.java).apply {
             putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, id)
+            putExtra("dir", dir)
             data = Uri.parse(toUri(Intent.URI_INTENT_SCHEME))
         }
         v.setRemoteAdapter(R.id.w_list, svc)
@@ -69,7 +86,7 @@ object WidgetUtil {
         v.setOnClickPendingIntent(R.id.w_head_text,
             PendingIntent.getActivity(c, 0, Intent(c, MainActivity::class.java), flags))
         v.setOnClickPendingIntent(R.id.w_refresh,
-            PendingIntent.getBroadcast(c, 1, Intent(c, FlightWidget::class.java).setAction(ACTION_REFRESH), flags))
+            PendingIntent.getBroadcast(c, 1, Intent(c, FlightWidgetArr::class.java).setAction(ACTION_REFRESH), flags))
         val cfgIntent = Intent(c, WidgetConfigActivity::class.java).apply {
             putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, id)
             data = Uri.parse("kno://widget-config/$id")
@@ -80,44 +97,36 @@ object WidgetUtil {
 }
 
 /**
- * Pilih flight untuk widget: yang sedang live (kedatangan belum mendarat & live, keberangkatan sudah berangkat
- * tapi belum tiba) dan yang baru saja mendarat / berangkat (2 jam terakhir). Dibagi seimbang antar arah.
+ * 5 flight terdekat yang belum landing (kedatangan) / belum berangkat (keberangkatan),
+ * ditambah semua flight delay yang masih belum landing / berangkat. Urut menurut jam estimasi.
  */
-fun pickLive(all: List<Flight>, n: Int): List<Flight> {
+fun pickUpcoming(all: List<Flight>): List<Flight> {
     val now = Fmt.now()
-    fun isLive(f: Flight) = !f.cancelled && !f.done &&
-        ((f.arrival && f.real == 0L && f.live) || (!f.arrival && f.departed))
-    fun isRecent(f: Flight) = f.real > 0L && f.real >= now - 7200L && !f.cancelled
-    fun order(l: List<Flight>): List<Flight> {
-        val live = l.filter { isLive(it) }.sortedBy { if (it.actual > 0L) it.actual else it.sched }
-        val recent = l.filter { !isLive(it) && isRecent(it) }.sortedByDescending { it.real }
-        return live + recent
-    }
-    val arr = order(all.filter { it.arrival })
-    val dep = order(all.filter { !it.arrival })
-    val aTake = minOf(arr.size, maxOf(n / 2, n - dep.size))
-    val dTake = minOf(dep.size, n - aTake)
-    val chosen = arr.take(aTake) + dep.take(dTake)
-    val live = chosen.filter { isLive(it) }.sortedBy { if (it.actual > 0L) it.actual else it.sched }
-    val rest = chosen.filter { !isLive(it) }.sortedByDescending { it.real }
-    return live + rest
+    fun eff(f: Flight) = if (f.actual > 0L) f.actual else f.sched
+    val pending = all.filter { !it.cancelled && !it.done && !it.departed && it.real == 0L }
+    val upcoming = pending.filter { eff(it) >= now - 1800L }.sortedBy { eff(it) }.take(5)
+    val keys = upcoming.map { it.key }.toSet()
+    val delayed = pending.filter { it.red && it.key !in keys }
+    return (upcoming + delayed).sortedBy { eff(it) }
 }
 
 class WidgetService : RemoteViewsService() {
     override fun onGetViewFactory(intent: Intent): RemoteViewsService.RemoteViewsFactory {
         AppCtx.set(applicationContext)
-        return Factory(applicationContext, intent.getIntExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, 0))
+        return Factory(applicationContext, intent.getIntExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, 0),
+            intent.getStringExtra("dir") ?: "ARR")
     }
 
-    class Factory(private val c: Context, private val id: Int) : RemoteViewsService.RemoteViewsFactory {
+    class Factory(private val c: Context, private val id: Int, private val dir: String) :
+        RemoteViewsService.RemoteViewsFactory {
         private var items = listOf<Flight>()
 
         override fun onCreate() {}
         override fun onDataSetChanged() {
             val cfg = Store.widget(c, id)
             try {
-                val all = Fr24.fetch(true, 2) + Fr24.fetch(false, 2)
-                items = pickLive(all.filter { !cfg.intl || it.international }, cfg.rows)
+                val all = Fr24.fetch(dir == "ARR", 2).filter { !cfg.intl || it.international }
+                items = pickUpcoming(all)
                 items.map { it.airlineIata to it.airlineIcao }.distinct().forEach { Logos.bitmap(c, it.first, it.second) }
             } catch (e: Exception) { /* pertahankan data lama */ }
         }
@@ -126,29 +135,23 @@ class WidgetService : RemoteViewsService() {
         override fun getViewAt(position: Int): RemoteViews {
             val v = RemoteViews(c.packageName, R.layout.widget_item)
             val f = items.getOrNull(position) ?: return v
-            val t = if (f.real > 0L) f.real else if (f.actual > 0L) f.actual else f.sched
-            val day = Fmt.dayLabel(t)
-            v.setTextViewText(R.id.w_time, Fmt.time(t) + if (day.isNotEmpty()) "\n$day" else "")
+            val day = Fmt.dayLabel(f.sched)
+            v.setTextViewText(R.id.w_time, Fmt.time(f.sched) + if (day.isNotEmpty()) "\n$day" else "")
 
-            val late = if (f.delayMin >= 10) " (+${f.delayMin} mnt)" else ""
+            // estimasi; tampilkan tanggal bila delay melewati tengah malam
+            val est = if (f.actual > 0L)
+                Fmt.time(f.actual) + if (Fmt.dayKey(f.actual) != Fmt.dayKey(f.sched)) " (${Fmt.dateShort(f.actual)})" else ""
+            else ""
             val status = when {
-                f.cancelled -> "Dibatalkan"
-                f.arrival && f.real > 0L -> "Mendarat ${Fmt.time(f.real)}$late"
-                f.arrival -> if (f.red) "DELAY${if (f.delayMin >= 10) " +${f.delayMin} mnt" else ""} · ETA ${Fmt.time(t)}"
-                             else "● Live · ETA ${Fmt.time(t)}"
-                f.done -> "Berangkat ${Fmt.time(f.real)}$late"
-                else -> (if (f.red) "DELAY$late · berangkat ${Fmt.time(f.real)}" else "● Terbang · berangkat ${Fmt.time(f.real)}") +
-                    (if (f.destEta > 0L) " · tiba ±${Fmt.time(f.destEta)}" else "")
+                f.red -> "DELAY" + (if (f.delayMin >= 10) " +${f.delayMin} mnt" else "") +
+                    (if (est.isNotEmpty()) " · est $est" else "")
+                f.status.isNotEmpty() -> (if (f.live) "● " else "") + Fmt.idStatus(f.status)
+                else -> "Terjadwal"
             }
-            val line1 = "${if (f.arrival) "🛬" else "🛫"} ${f.number} · ${f.city} (${f.iata})" +
-                if (f.aircraft.isNotEmpty()) " · ${f.aircraft}" else ""
+            val line1 = "${f.number} · ${f.city} (${f.iata})" + if (f.aircraft.isNotEmpty()) " · ${f.aircraft}" else ""
             v.setTextViewText(R.id.w_info, "$line1\n$status")
-            // merah hanya untuk delay yang belum terbang / sedang terbang
-            val color = when {
-                f.red -> 0xFFFF6B6B.toInt()
-                f.done || (f.arrival && f.real > 0L) -> 0xFFA7B4BC.toInt()
-                else -> 0xFFFFFFFF.toInt()
-            }
+            // merah hanya untuk delay yang belum berangkat / belum landing
+            val color = if (f.red) 0xFFFF6B6B.toInt() else 0xFFFFFFFF.toInt()
             v.setTextColor(R.id.w_info, color)
             v.setTextColor(R.id.w_time, color)
             val logo = Logos.bitmap(c, f.airlineIata, f.airlineIcao)
@@ -173,13 +176,14 @@ class WidgetConfigActivity : ComponentActivity() {
         if (id == AppWidgetManager.INVALID_APPWIDGET_ID) { finish(); return }
         AppCtx.set(this)
         ThemeState.load(this)
+        val dir = WidgetUtil.dirOf(this, id)
         val old = Store.widget(this, id)
         setContent {
             AppTheme {
-                ConfigScreen(old) { cfg ->
+                ConfigScreen(old, if (dir == "ARR") "Kedatangan" else "Keberangkatan") { cfg ->
                     Store.saveWidget(this, id, cfg)
                     val m = AppWidgetManager.getInstance(this)
-                    WidgetUtil.update(this, m, id)
+                    WidgetUtil.update(this, m, id, dir)
                     m.notifyAppWidgetViewDataChanged(id, R.id.w_list)
                     Refresh.schedule(this)
                     setResult(RESULT_OK, Intent().putExtra(AppWidgetManager.EXTRA_APPWIDGET_ID, id))
@@ -191,22 +195,17 @@ class WidgetConfigActivity : ComponentActivity() {
 }
 
 @Composable
-fun ConfigScreen(init: WidgetCfg, onSave: (WidgetCfg) -> Unit) {
+fun ConfigScreen(init: WidgetCfg, dirLabel: String, onSave: (WidgetCfg) -> Unit) {
     var intl by remember { mutableStateOf(init.intl) }
-    var rows by remember { mutableIntStateOf(init.rows) }
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.padding(20.dp).padding(top = 24.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-            Text("Widget KNO Live", style = MaterialTheme.typography.titleLarge)
+            Text("Widget KNO — $dirLabel", style = MaterialTheme.typography.titleLarge)
             Text("Jenis flight")
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilterChip(intl, { intl = true }, { Text("Internasional saja") })
                 FilterChip(!intl, { intl = false }, { Text("Semua flight") })
             }
-            Text("Jumlah baris")
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf(6, 8, 10).forEach { n -> FilterChip(rows == n, { rows = n }, { Text("$n") }) }
-            }
-            Button(onClick = { onSave(WidgetCfg(intl, rows)) }) { Text("Simpan") }
+            Button(onClick = { onSave(WidgetCfg(intl)) }) { Text("Simpan") }
         }
     }
 }
